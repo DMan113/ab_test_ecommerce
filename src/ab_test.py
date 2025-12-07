@@ -19,7 +19,7 @@ class ABTestAnalyzer:
         if db_connection_string is None:
             db_connection_string = os.getenv(
                 'DATABASE_URL',
-                'postgresql://ab_test_user:1234@localhost:5432/ecommerce_ab_test?client_encoding=utf8'
+                'postgresql://DB_USER:DB_PASSWORD@DB_HOST:DB_PORT/DB_NAME?client_encoding=utf8'
             )
         self.engine = create_engine(db_connection_string)
 
@@ -38,6 +38,8 @@ class ABTestAnalyzer:
             u.user_id,
             ua.group_id,
             eg.group_name,
+            u.country,
+            u.device_type,
             COUNT(DISTINCT t.transaction_id) as transaction_count,
             SUM(t.total_amount) as total_revenue,
             CASE WHEN COUNT(t.transaction_id) > 0 THEN 1 ELSE 0 END as converted
@@ -45,13 +47,17 @@ class ABTestAnalyzer:
         JOIN user_assignments ua ON u.user_id = ua.user_id
         JOIN experiment_groups eg ON ua.group_id = eg.group_id
         LEFT JOIN transactions t ON u.user_id = t.user_id
-        WHERE ua.experiment_name = '{experiment_name}'
-        GROUP BY u.user_id, ua.group_id, eg.group_name
+        WHERE ua.experiment_name = %(exp_name)s
+        GROUP BY u.user_id, ua.group_id, eg.group_name, u.country, u.device_type
         """
 
-        df = pd.read_sql(query, self.engine)
-        print(f"Loaded data for {len(df)} users")
-        return df
+        try:
+            df = pd.read_sql(query, self.engine, params={'exp_name': experiment_name})
+            print(f"Loaded data for {len(df)} users")
+            return df
+        except Exception as e:
+            print(f"Error loading data: {e}")
+            return pd.DataFrame()
 
     def calculate_conversion_rate(self, data):
         """
@@ -160,7 +166,7 @@ class ABTestAnalyzer:
         Args:
             control_data: control group data
 
-        treatment_data: test group data
+            treatment_data: test group data
 
         Returns:
             dict with test results
@@ -168,8 +174,8 @@ class ABTestAnalyzer:
         control_revenue = control_data['total_revenue'].fillna(0)
         treatment_revenue = treatment_data['total_revenue'].fillna(0)
 
-        # T-test
-        t_stat, p_value = stats.ttest_ind(treatment_revenue, control_revenue)
+        # T-test (Welch's with equal_var=False)
+        t_stat, p_value = stats.ttest_ind(treatment_revenue, control_revenue, equal_var=False)
 
         # Means
         control_mean = control_revenue.mean()
@@ -290,6 +296,11 @@ class ABTestAnalyzer:
             mde=0.02  # 2% minimum detected effect
         )
 
+        # Check if sample sufficient
+        sample_warning = ""
+        if len(control_data) < recommended_sample_size or len(treatment_data) < recommended_sample_size:
+            sample_warning = f"Warning: Sample size per group ({min(len(control_data), len(treatment_data))}) is less than recommended ({recommended_sample_size}). Results may lack power."
+
         return {
             'experiment_name': experiment_name,
             'sample_sizes': {
@@ -297,6 +308,7 @@ class ABTestAnalyzer:
                 'treatment': len(treatment_data)
             },
             'recommended_sample_size': recommended_sample_size,
+            'sample_warning': sample_warning,
             'conversion_metrics': conversion_metrics,
             'revenue_metrics': revenue_metrics,
             'conversion_test': conversion_test,
@@ -313,6 +325,9 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print(f"A/BTEST REPORT: {report['experiment_name']}")
     print("=" * 60)
+
+    if report['sample_warning']:
+        print(f"\n⚠️ {report['sample_warning']}")
 
     print("\n📊 SAMPLE SIZES:")
     print(f"Control: {report['sample_sizes']['control']}")
@@ -332,4 +347,3 @@ if __name__ == "__main__":
     print("\n💵 REVENUE TEST:")
     for key, value in report['revenue_test'].items():
         print(f"{key}: {value}")
-

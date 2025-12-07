@@ -1,390 +1,498 @@
 # analysis_extensions.py
 """
-Extended analysis helpers for the A/B testing project.
+Extended, project-adapted report generator for A/B testing.
 
-Usage:
-    from analysis_extensions import run_full_extended_report
-    report = run_full_extended_report(ab, coh, viz, data, conversion, revenue, retention, cohort_df)
+Compatibility assumptions (based on project):
+- `ab` is ABTestAnalyzer with:
+    - z_test_proportions(control_df, treatment_df) -> dict (see keys below)
+    - t_test_revenue(control_df, treatment_df) -> dict
+    - sequential_testing(data) -> DataFrame
+    - engine -> SQLAlchemy engine
+- `coh` is CohortAnalyzer with:
+    - create_cohort_pivot_table(retention_df) -> dict(group_name -> pivot_df)
+    - calculate_cohort_revenue(cohort_df) -> DataFrame
+- `viz` is ABTestVisualizer returning Plotly figures for the named methods.
+
+This module:
+- generates summary metrics
+- runs tests and interprets results
+- saves visualizations (png via kaleido; html fallback)
+- writes a markdown report and optionally converts to pdf
 """
 
-from typing import Dict, Any, Optional
+from __future__ import annotations
 import os
 import json
 import subprocess
 from datetime import datetime
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, Optional, List, Tuple
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 
-# Output folders (relative to current working dir)
-REPORT_DIR = "analysis_report"
-PLOTS_DIR = os.path.join(REPORT_DIR, "plots")
-os.makedirs(PLOTS_DIR, exist_ok=True)
+# ---------- Config / Data models ----------
 
+@dataclass
+class ReportConfig:
+    report_dir: str = "analysis_report"
+    plots_dir: str = "plots"
+    include_pdf: bool = False       # Pandoc often missing; default off
+    segment_by: str = "device_type"
+    top_n_countries: int = 10
+    alpha: float = 0.05
+
+    @property
+    def plots_path(self) -> Path:
+        return Path(self.report_dir) / self.plots_dir
+
+@dataclass
+class SummaryMetrics:
+    total_rows: int
+    total_users: int
+    control_users: int
+    treatment_users: int
+    balance_ratio: float
+    overall_conversion_rate: float
+    data_quality_score: float
+
+    def to_dict(self):
+        return asdict(self)
+
+@dataclass
+class TestResults:
+    control_metric: float
+    treatment_metric: float
+    lift_percentage: float
+    absolute_difference: float
+    test_statistic: float
+    p_value: float
+    is_significant: bool
+    confidence_interval: Tuple[float, float]
+    effect_size: Optional[float] = None
+
+    def to_dict(self):
+        d = asdict(self)
+        # ensure numeric types are python-native
+        for k,v in d.items():
+            if isinstance(v, (np.floating, np.integer)):
+                d[k] = float(v)
+        return d
 
 # ---------- Utilities ----------
-def _fmt_pct(x: float, ndigits: int = 2) -> str:
-    if pd.isna(x):
-        return "N/A"
-    return f"{x*100:.{ndigits}f}%"
 
+def _ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
 
-def _save_fig(fig, name: str, fmt: str = "png") -> Optional[str]:
-    """
-    Save a Plotly figure. Try image export first (kaleido); fall back to HTML.
-    Returns path or None on failure.
-    """
-    path = os.path.join(PLOTS_DIR, f"{name}.{fmt}")
+def _safe_write_image(fig, path: Path):
+    # Attempt PNG via kaleido; fallback to HTML
     try:
-        # prefer static export (requires kaleido)
-        fig.write_image(path, scale=2)
-        return path
+        import kaleido  # ensure available
+        fig.write_image(str(path), scale=2)
+        return str(path)
     except Exception:
         # fallback to html
-        html_path = os.path.join(PLOTS_DIR, f"{name}.html")
+        html_path = path.with_suffix('.html')
         try:
-            fig.write_html(html_path)
-            return html_path
+            fig.write_html(str(html_path))
+            return str(html_path)
+        except Exception as e:
+            return None
+
+def _fmt_pct(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "N/A"
+    try:
+        return f"{v*100:.2f}%"
+    except Exception:
+        # if already percent (rare), try direct format
+        try:
+            return f"{float(v):.2f}%"
+        except Exception:
+            return str(v)
+
+# ---------- Main class ----------
+
+class ExtendedReportGenerator:
+    def __init__(self, ab, coh, viz, config: Optional[ReportConfig] = None):
+        self.ab = ab
+        self.coh = coh
+        self.viz = viz
+        self.config = config or ReportConfig()
+        # prepare directories
+        _ensure_dir(Path(self.config.report_dir))
+        _ensure_dir(self.config.plots_path)
+        # single timestamp for consistent filenames
+        self._ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # ---------------- Summary ----------------
+    def generate_summary(self, data: pd.DataFrame) -> SummaryMetrics:
+        if data is None or data.empty:
+            return SummaryMetrics(0, 0, 0, 0, 0.0, 0.0, 0.0)
+
+        total_rows = len(data)
+        total_users = int(data['user_id'].nunique()) if 'user_id' in data.columns else total_rows
+
+        # group counts
+        if 'group_name' in data.columns:
+            grp = data.groupby('group_name').agg(user_count=('user_id', 'count'),
+                                                 conversions=('converted', 'sum' if 'converted' in data.columns else 'count'))
+            control_users = int(grp.loc['control','user_count']) if 'control' in grp.index else 0
+            treatment_users = int(grp.loc['treatment','user_count']) if 'treatment' in grp.index else 0
+        else:
+            control_users = 0
+            treatment_users = 0
+
+        balance_ratio = 0.0
+        if control_users and treatment_users:
+            balance_ratio = abs(control_users - treatment_users) / max(control_users, treatment_users)
+
+        overall_conversion_rate = (data['converted'].sum() / total_users) if ('converted' in data.columns and total_users>0) else 0.0
+
+        data_quality_score = self._calc_data_quality(data, balance_ratio)
+
+        return SummaryMetrics(
+            total_rows=total_rows,
+            total_users=total_users,
+            control_users=control_users,
+            treatment_users=treatment_users,
+            balance_ratio=balance_ratio,
+            overall_conversion_rate=overall_conversion_rate,
+            data_quality_score=data_quality_score
+        )
+
+    def _calc_data_quality(self, data: pd.DataFrame, balance_ratio: float) -> float:
+        score = 100.0
+        score -= min(balance_ratio * 100, 20)
+        if 'total_revenue' in data.columns:
+            missing_pct = data['total_revenue'].isna().sum() / max(len(data),1)
+            score -= missing_pct * 30
+        if len(data) < 1000:
+            score -= 20
+        elif len(data) < 10000:
+            score -= 10
+        return max(0.0, score)
+
+    # ---------------- Interpretation ----------------
+    def interpret_results(self, data: pd.DataFrame, conversion_df: pd.DataFrame, revenue_df: pd.DataFrame) -> Dict[str, Any]:
+        # ensure groups exist
+        control = data[data['group_name']=='control'] if 'group_name' in data.columns else data
+        treatment = data[data['group_name']=='treatment'] if 'group_name' in data.columns else data
+
+        conv_raw = self.ab.z_test_proportions(control, treatment)
+        rev_raw = self.ab.t_test_revenue(control, treatment)
+
+        conv = TestResults(
+            control_metric = conv_raw.get('control_conversion_rate', 0.0),
+            treatment_metric = conv_raw.get('treatment_conversion_rate', 0.0),
+            lift_percentage = conv_raw.get('lift_percentage', 0.0),
+            absolute_difference = conv_raw.get('treatment_conversion_rate', 0.0) - conv_raw.get('control_conversion_rate', 0.0),
+            test_statistic = conv_raw.get('z_statistic', 0.0),
+            p_value = conv_raw.get('p_value', 1.0),
+            is_significant = conv_raw.get('statistically_significant', False),
+            confidence_interval = conv_raw.get('confidence_interval_95', (0.0,0.0)),
+            effect_size = conv_raw.get('cohens_d', None)
+        )
+
+        rev = TestResults(
+            control_metric = rev_raw.get('control_avg_revenue', 0.0),
+            treatment_metric = rev_raw.get('treatment_avg_revenue', 0.0),
+            lift_percentage = rev_raw.get('lift_percentage', 0.0),
+            absolute_difference = rev_raw.get('treatment_avg_revenue', 0.0) - rev_raw.get('control_avg_revenue', 0.0),
+            test_statistic = rev_raw.get('t_statistic', 0.0),
+            p_value = rev_raw.get('p_value', 1.0),
+            is_significant = rev_raw.get('statistically_significant', False),
+            confidence_interval = (0.0, 0.0),
+            effect_size = rev_raw.get('cohens_d', None)
+        )
+
+        recommendations = self._build_recommendations(conv, rev, data)
+        return {'conversion_test': conv, 'revenue_test': rev, 'recommendations': recommendations}
+
+    def _build_recommendations(self, conv: TestResults, rev: TestResults, data: pd.DataFrame) -> List[str]:
+        recs: List[str] = []
+        n = len(data)
+        if n < 1000:
+            recs.append("⚠️ Small sample (<1000). Results may be unreliable.")
+        if conv.is_significant:
+            if conv.lift_percentage > 0:
+                recs.append(f"✅ Conversion up {conv.lift_percentage:.2f}% — consider rollout.")
+            else:
+                recs.append(f"❌ Conversion down {abs(conv.lift_percentage):.2f}% — do not rollout.")
+        else:
+            recs.append(f"⚪ No significant conversion difference (p={conv.p_value:.4f}).")
+        if rev.is_significant:
+            recs.append(f"💰 Revenue per user change significant (lift {rev.lift_percentage:.2f}%).")
+        else:
+            recs.append(f"⚪ No significant revenue difference (p={rev.p_value:.4f}).")
+        if (not conv.is_significant) and (not rev.is_significant):
+            recs.append("Next steps: segment-level analysis, verify data, longer test or larger sample.")
+        return recs
+
+    # ---------------- Data quality ----------------
+    def check_data_quality(self, data: pd.DataFrame) -> Dict[str, Any]:
+        checks = {'total_rows': len(data), 'missing_values': {}, 'outliers': {}, 'distribution': {}}
+        for col in data.columns:
+            miss = int(data[col].isna().sum())
+            if miss > 0:
+                checks['missing_values'][col] = {'count': miss, 'percentage': round(miss / max(len(data),1) * 100, 2)}
+        if 'total_revenue' in data.columns:
+            rev = data['total_revenue'].dropna()
+            if len(rev) > 0:
+                q1, q3 = rev.quantile([0.25, 0.75])
+                iqr = q3 - q1
+                out = rev[(rev < q1 - 1.5*iqr) | (rev > q3 + 1.5*iqr)]
+                checks['outliers']['revenue'] = {'count': int(len(out)), 'percentage': round(len(out)/len(rev)*100,2),
+                                                'max_value': float(rev.max()), 'p99_value': float(rev.quantile(0.99))}
+                checks['distribution']['revenue'] = {'mean': float(rev.mean()), 'median': float(rev.median()),
+                                                    'std': float(rev.std()), 'skewness': float(rev.skew())}
+        return checks
+
+    # ---------------- Segmentation ----------------
+    def analyze_segments(self, data: pd.DataFrame, segment_by: Optional[str] = None) -> Dict[str, Any]:
+        seg_col = segment_by or self.config.segment_by
+        if seg_col is None:
+            return {}
+        if seg_col not in data.columns:
+            return {'error': f"Column '{seg_col}' not found in data"}
+        df = data.copy()
+        if seg_col == 'country':
+            top = df['country'].value_counts().head(self.config.top_n_countries).index.tolist()
+            df = df[df['country'].isin(top)].copy()
+        metrics = (df.groupby(['group_name', seg_col])
+                    .agg(users=('user_id','count'),
+                         conversions=('converted','sum'),
+                         total_revenue=('total_revenue', lambda s: s.sum() if 'total_revenue' in df.columns else 0))
+                    .reset_index())
+        metrics['conversion_rate'] = metrics['conversions'] / metrics['users']
+        metrics['avg_revenue'] = metrics['total_revenue'] / metrics['users'].replace({0: np.nan})
+        # lift table
+        lifts = []
+        for val in metrics[seg_col].unique():
+            sub = metrics[metrics[seg_col]==val]
+            if set(['control','treatment']).issubset(sub['group_name'].values):
+                c = float(sub[sub['group_name']=='control']['conversion_rate'].iloc[0])
+                t = float(sub[sub['group_name']=='treatment']['conversion_rate'].iloc[0])
+                lift_pct = ((t - c) / c * 100) if c > 0 else 0.0
+                lifts.append({seg_col: val, 'control_conversion': c, 'treatment_conversion': t, 'lift_pct': lift_pct})
+        return {f'segments_{seg_col}': metrics, f'lift_by_{seg_col}': pd.DataFrame(lifts)}
+
+    # ---------------- Visualizations export ----------------
+    def save_all_visualizations(self, conversion_df: pd.DataFrame, revenue_df: pd.DataFrame,
+                                retention_df: pd.DataFrame, cohort_df: pd.DataFrame, data: pd.DataFrame) -> Dict[str, Any]:
+        saved: Dict[str, Any] = {}
+        plots_path = self.config.plots_path
+        _ensure_dir(plots_path)
+
+        # conversion
+        try:
+            fig = self.viz.plot_conversion_rate(conversion_df)
+            p = plots_path / f"conversion_rate_{self._ts}.png"
+            saved['conversion_rate'] = _safe_write_image(fig, p)
+        except Exception as e:
+            saved['conversion_rate_error'] = str(e)
+
+        # revenue
+        try:
+            fig = self.viz.plot_revenue_comparison(revenue_df)
+            p = plots_path / f"revenue_comparison_{self._ts}.png"
+            saved['revenue_comparison'] = _safe_write_image(fig, p)
+        except Exception as e:
+            saved['revenue_comparison_error'] = str(e)
+
+        # cohort heatmaps
+        try:
+            pivots = self.coh.create_cohort_pivot_table(retention_df)
+            saved['cohort_heatmaps'] = {}
+            for g, pivot in pivots.items():
+                fig = self.viz.plot_cohort_heatmap(pivot, g)
+                p = plots_path / f"cohort_heatmap_{g}_{self._ts}.png"
+                saved['cohort_heatmaps'][g] = _safe_write_image(fig, p)
+        except Exception as e:
+            saved['cohort_heatmaps_error'] = str(e)
+
+        # retention curves
+        try:
+            fig = self.viz.plot_retention_curves(retention_df)
+            p = plots_path / f"retention_curves_{self._ts}.png"
+            saved['retention_curves'] = _safe_write_image(fig, p)
+        except Exception as e:
+            saved['retention_curves_error'] = str(e)
+
+        # cumulative revenue
+        try:
+            rev_cohort = self.coh.calculate_cohort_revenue(cohort_df)
+            fig = self.viz.plot_cumulative_revenue(rev_cohort)
+            p = plots_path / f"cumulative_revenue_{self._ts}.png"
+            saved['cumulative_revenue'] = _safe_write_image(fig, p)
+        except Exception as e:
+            saved['cumulative_revenue_error'] = str(e)
+
+        # funnel - guard existence
+        try:
+            funnel_df = None
+            if hasattr(self.ab, 'engine') and self.ab.engine is not None:
+                # quick test: try reading, but catch errors if view/table absent
+                try:
+                    funnel_df = pd.read_sql("SELECT * FROM conversion_funnel", self.ab.engine)
+                except Exception:
+                    funnel_df = None
+            if funnel_df is not None and not funnel_df.empty:
+                fig = self.viz.plot_funnel_analysis(funnel_df)
+                p = plots_path / f"funnel_{self._ts}.png"
+                saved['funnel'] = _safe_write_image(fig, p)
+            else:
+                saved['funnel'] = None
+        except Exception as e:
+            saved['funnel_error'] = str(e)
+
+        # sequential
+        try:
+            seq = self.ab.sequential_testing(data)
+            fig = self.viz.plot_sequential_testing(seq)
+            p = plots_path / f"sequential_testing_{self._ts}.png"
+            saved['sequential_testing'] = _safe_write_image(fig, p)
+        except Exception as e:
+            saved['sequential_testing_error'] = str(e)
+
+        return saved
+
+    # ---------------- Markdown report ----------------
+    def generate_markdown_report(self, summary: SummaryMetrics, interpretation: Dict[str,Any],
+                                 quality_checks: Dict[str,Any], segments: Dict[str,Any],
+                                 visualizations: Dict[str,Any]) -> str:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        report_path = Path(self.config.report_dir)
+        _ensure_dir(report_path)
+        md_file = report_path / f"ab_report_{self._ts}.md"
+
+        conv = interpretation['conversion_test']
+        rev = interpretation['revenue_test']
+
+        lines: List[str] = []
+        lines.append(f"# A/B Test Report")
+        lines.append(f"_Generated: {now}_\n")
+        # Decision
+        decision = "RECOMMEND ROLLOUT" if conv.is_significant and conv.lift_percentage > 0 else "DO NOT ROLLOUT"
+        lines.append(f"## Decision: **{decision}**\n")
+
+        # Key metrics (percentages: multiply by 100)
+        lines.append("### Key metrics")
+        lines.append("| Metric | Control | Treatment | Lift | Significant |")
+        lines.append("|---|---:|---:|---:|---:|")
+        lines.append(f"| Conversion rate | {_fmt_pct(conv.control_metric)} | {_fmt_pct(conv.treatment_metric)} | {conv.lift_percentage:+.2f}% | {'✅' if conv.is_significant else '❌'} |")
+        lines.append(f"| Revenue per user | ${convify(rev.control_metric):s} | ${convify(rev.treatment_metric):s} | {rev.lift_percentage:+.2f}% | {'✅' if rev.is_significant else '❌'} |")
+        lines.append("")
+
+        # Dataset overview
+        lines.append("## Dataset overview")
+        lines.append(f"- Total rows: {summary.total_rows:,}")
+        lines.append(f"- Total users: {summary.total_users:,}")
+        lines.append(f"- Control users: {summary.control_users:,}")
+        lines.append(f"- Treatment users: {summary.treatment_users:,}")
+        lines.append(f"- Balance deviation: {summary.balance_ratio*100:.2f}%")
+        lines.append(f"- Overall conversion: {summary.overall_conversion_rate*100:.2f}%")
+        lines.append(f"- Data quality score: {summary.data_quality_score:.1f}/100\n")
+
+        # Data quality
+        lines.append("## Data quality checks\n")
+        lines.append("```json")
+        lines.append(json.dumps(quality_checks, indent=2, default=str))
+        lines.append("```\n")
+
+        # Segments
+        lines.append("## Segmentation (sample)\n")
+        if isinstance(segments, dict):
+            for k, v in segments.items():
+                lines.append(f"### {k}")
+                if isinstance(v, pd.DataFrame):
+                    try:
+                        lines.append(v.head(10).to_markdown(index=False))
+                    except Exception:
+                        lines.append(str(v.head(10)))
+                else:
+                    lines.append(f"⚠️ {v}")
+                lines.append("")
+        else:
+            lines.append("No segmentation results.\n")
+
+        # Recommendations
+        lines.append("## Recommendations\n")
+        for r in interpretation.get('recommendations', []):
+            lines.append(f"- {r}")
+        lines.append("")
+
+        # Visualizations list
+        lines.append("## Visualizations\n")
+        for name, path in (visualizations or {}).items():
+            if isinstance(path, dict):
+                lines.append(f"### {name}")
+                for sub, p in path.items():
+                    lines.append(f"- {sub}: {p}")
+            else:
+                lines.append(f"- {name}: {path}")
+        lines.append("")
+
+        # Appendix
+        lines.append("## Appendix")
+        lines.append("- Conversion test: two-proportion z-test")
+        lines.append("- Revenue test: Welch's t-test")
+        lines.append("- Significance: alpha = 0.05\n")
+
+        # write file
+        with open(md_file, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+
+        return str(md_file)
+
+    # ---------------- PDF (optional) ----------------
+    def convert_to_pdf(self, md_path: str) -> Optional[str]:
+        if not self.config.include_pdf:
+            return None
+        pdf_path = md_path.replace('.md', '.pdf')
+        try:
+            subprocess.run(['pandoc', md_path, '-o', pdf_path], check=True, capture_output=True)
+            return pdf_path
         except Exception:
             return None
 
-
-# ---------- 1) Summary ----------
-def generate_summary(data: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Create a compact summary of the A/B dataset.
-    Expects columns: user_id, group_name, converted, transaction_count, total_revenue
-    """
-    summary: Dict[str, Any] = {}
-    summary['total_rows'] = len(data)
-
-    if 'group_name' not in data.columns or 'user_id' not in data.columns:
-        summary['by_group'] = None
-        summary['balance_ratio'] = None
-        summary['overall_conversion_rate'] = None
-        return summary
-
-    by_group = (
-        data.groupby('group_name')
-        .agg(users=('user_id', 'count'),
-             conversions=('converted', 'sum'),
-             transaction_count=('transaction_count', 'sum'),
-             total_revenue=('total_revenue', 'sum'))
-        .reset_index()
-    )
-    # conversion rate 0..1
-    by_group['conversion_rate'] = (by_group['conversions'] / by_group['users']).fillna(0)
-    summary['by_group'] = by_group
-
-    # balance measurement (relative diff)
-    if set(['control', 'treatment']).issubset(set(by_group['group_name'])):
-        control_users = int(by_group.loc[by_group['group_name'] == 'control', 'users'].iloc[0])
-        treatment_users = int(by_group.loc[by_group['group_name'] == 'treatment', 'users'].iloc[0])
-        summary['balance_ratio'] = abs(control_users - treatment_users) / max(control_users, treatment_users)
-    else:
-        summary['balance_ratio'] = None
-
-    # overall
-    total_users = by_group['users'].sum()
-    total_conv = by_group['conversions'].sum()
-    summary['overall_conversion_rate'] = (total_conv / total_users) if total_users > 0 else 0
-
-    return summary
-
-
-# ---------- 2) Interpretation ----------
-def interpret_ab_test(ab, data: pd.DataFrame, conversion_df: pd.DataFrame, revenue_df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Run the statistical tests implemented in ABTestAnalyzer and produce a readable summary.
-    Expects ab to have methods: z_test_proportions(control_df, treatment_df) and t_test_revenue(control_df, treatment_df)
-    """
-    control = data[data['group_name'] == 'control']
-    treatment = data[data['group_name'] == 'treatment']
-
-    conv_test = ab.z_test_proportions(control, treatment)
-    rev_test = ab.t_test_revenue(control, treatment)
-
-    conv_out = {k: v for k, v in conv_test.items()}
-    rev_out = {k: v for k, v in rev_test.items()}
-
-    plain_lines = []
-    plain_lines.append("# A/B Test Interpretation")
-    plain_lines.append("## Conversion")
-    # guard keys presence
-    plain_lines.append(f"Control conversion rate: {conv_out.get('control_conversion_rate', 'N/A')}")
-    plain_lines.append(f"Treatment conversion rate: {conv_out.get('treatment_conversion_rate', 'N/A')}")
-    plain_lines.append(f"Lift (treatment vs control): {conv_out.get('lift_percentage', 'N/A')}")
-    plain_lines.append(f"Z-statistic: {conv_out.get('z_statistic', 'N/A')}")
-    plain_lines.append(f"p-value: {conv_out.get('p_value', 'N/A')}")
-    plain_lines.append(f"Statistically significant (α=0.05): {conv_out.get('statistically_significant', 'N/A')}")
-    plain_lines.append("")
-    plain_lines.append("## Revenue")
-    plain_lines.append(f"Control avg revenue/user: {rev_out.get('control_avg_revenue', 'N/A')}")
-    plain_lines.append(f"Treatment avg revenue/user: {rev_out.get('treatment_avg_revenue', 'N/A')}")
-    plain_lines.append(f"Revenue lift: {rev_out.get('lift_percentage', 'N/A')}")
-    plain_lines.append(f"T-statistic: {rev_out.get('t_statistic', 'N/A')}")
-    plain_lines.append(f"p-value: {rev_out.get('p_value', 'N/A')}")
-    plain_lines.append(f"Statistically significant: {rev_out.get('statistically_significant', 'N/A')}")
-    plain_lines.append("")
-
-    if conv_out.get('statistically_significant'):
-        plain_lines.append("Recommendation: conversion uplift is statistically significant — consider rollout.")
-    else:
-        plain_lines.append("Recommendation: no significant uplift detected — investigate segments, data quality, or increase sample size.")
-
-    return {
-        'conversion_test': conv_out,
-        'revenue_test': rev_out,
-        'plain_text': "\n".join(plain_lines)
-    }
-
-
-# ---------- 3) Data quality ----------
-def data_quality_checks(data: pd.DataFrame) -> Dict[str, Any]:
-    checks: Dict[str, Any] = {}
-    checks['rows'] = len(data)
-    checks['nulls'] = data.isna().sum().to_dict()
-
-    if 'total_revenue' in data.columns:
-        s = data['total_revenue'].fillna(0)
-        checks['revenue_mean'] = float(s.mean())
-        checks['revenue_median'] = float(s.median())
-        checks['revenue_q99'] = float(s.quantile(0.99))
-    return checks
-
-
-# ---------- 4) Segmentation ----------
-def segmentation_analysis(data: pd.DataFrame, by: str = 'device_type', top_n_countries: int = 10) -> Dict[str, pd.DataFrame]:
-    """
-    Produce segment-level metrics. Returns dictionary of DataFrames or {'error': msg} values.
-    """
-    out = {}
-    if by is None:
-        return out
-
-    if by == 'country':
-        if 'country' not in data.columns:
-            return {'error': 'country not in data'}
-        top = data['country'].value_counts().head(top_n_countries).index.tolist()
-        df = data[data['country'].isin(top)].copy()
-        grp = (
-            df.groupby(['group_name', 'country'])
-            .agg(users=('user_id', 'count'), conversions=('converted', 'sum'))
-            .reset_index()
-        )
-        grp['conversion_rate'] = grp['conversions'] / grp['users']
-        out['by_country_top'] = grp
-    else:
-        if by not in data.columns:
-            return {'error': f'{by} not in data'}
-        df = data.copy()
-        grp = (
-            df.groupby(['group_name', by])
-            .agg(users=('user_id', 'count'), conversions=('converted', 'sum'))
-            .reset_index()
-        )
-        grp['conversion_rate'] = grp['conversions'] / grp['users']
-        out[f'by_{by}'] = grp
-    return out
-
-
-# ---------- 5) Export plots ----------
-def save_all_plots(viz, conversion_df: pd.DataFrame, revenue_df: pd.DataFrame, retention_df: pd.DataFrame,
-                   cohort_df: pd.DataFrame, ab, data: pd.DataFrame, coh) -> Dict[str, Any]:
-    """
-    Save main visualizations. coh must be a CohortAnalyzer instance.
-    Returns dict with saved file paths or error strings.
-    """
-    saved: Dict[str, Any] = {}
-
-    # conversion
-    try:
-        fig = viz.plot_conversion_rate(conversion_df)
-        saved['conversion'] = _save_fig(fig, 'conversion_rate')
-    except Exception as e:
-        saved['conversion_error'] = str(e)
-
-    # revenue
-    try:
-        fig = viz.plot_revenue_comparison(revenue_df)
-        saved['revenue'] = _save_fig(fig, 'revenue_comparison')
-    except Exception as e:
-        saved['revenue_error'] = str(e)
-
-    # cohort heatmaps
-    try:
-        pivots = coh.create_cohort_pivot_table(retention_df)
-        saved['cohort_heatmaps'] = {}
-        for g, p in pivots.items():
-            fig = viz.plot_cohort_heatmap(p, g)
-            saved['cohort_heatmaps'][g] = _save_fig(fig, f'cohort_heatmap_{g}')
-    except Exception as e:
-        saved['cohort_heatmaps_error'] = str(e)
-
-    # retention curves
-    try:
-        fig = viz.plot_retention_curves(retention_df)
-        saved['retention_curves'] = _save_fig(fig, 'retention_curves')
-    except Exception as e:
-        saved['retention_curves_error'] = str(e)
-
-    # cumulative revenue by cohort
-    try:
-        rev = coh.calculate_cohort_revenue(cohort_df)
-        fig = viz.plot_cumulative_revenue(rev)
-        saved['cumulative_revenue'] = _save_fig(fig, 'cumulative_revenue')
-    except Exception as e:
-        saved['cumulative_revenue_error'] = str(e)
-
-    # funnel (optional)
-    try:
-        funnel_df = pd.read_sql("SELECT * FROM conversion_funnel", ab.engine)
-        fig = viz.plot_funnel_analysis(funnel_df)
-        saved['funnel'] = _save_fig(fig, 'funnel')
-    except Exception as e:
-        saved['funnel_error'] = str(e)
-
-    # sequential testing
-    try:
-        seq = ab.sequential_testing(data)
-        fig = viz.plot_sequential_testing(seq)
-        saved['sequential'] = _save_fig(fig, 'sequential_testing')
-    except Exception as e:
-        saved['sequential_error'] = str(e)
-
-    return saved
-
-
-# ---------- 6) Report generation ----------
-def generate_report_md(summary: Dict[str, Any], interp: Dict[str, Any], checks: Dict[str, Any],
-                       segment_results: Dict[str, pd.DataFrame], saved_plots: Dict[str, Any],
-                       filename: Optional[str] = None) -> str:
-    if filename is None:
-        filename = os.path.join(REPORT_DIR, f"ab_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md")
-
-    lines = []
-    lines.append(f"# A/B Test Report — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append("\n## 1. Summary of data\n")
-    lines.append(f"- Total rows: **{summary.get('total_rows', 0):,}**")
-
-    by = summary.get('by_group')
-    if by is not None and isinstance(by, pd.DataFrame):
-        for _, r in by.iterrows():
-            lines.append(f"- **{r['group_name'].capitalize()}**: users={int(r['users']):,}, conversions={int(r['conversions'])}, conversion_rate={r['conversion_rate']:.4f}")
-
-    bal = summary.get('balance_ratio')
-    if bal is not None:
-        lines.append(f"\n- Balance deviation: {bal*100:.2f}%\n")
-
-    lines.append("## 2. Data quality checks\n")
-    lines.append("```")
-    lines.append(json.dumps(checks, indent=2, default=str))
-    lines.append("```")
-
-    lines.append("## 3. Interpretation\n")
-    lines.append(interp.get('plain_text', ''))
-
-    lines.append("## 4. Segment analysis (sample)\n")
-    # robustly handle segment_results values (DataFrame or error str)
-    if isinstance(segment_results, dict):
-        for k, df in segment_results.items():
-            lines.append(f"### {k}")
-            if isinstance(df, pd.DataFrame):
-                try:
-                    lines.append(df.head(10).to_markdown(index=False))
-                except Exception:
-                    lines.append(str(df.head(10)))
-            else:
-                # df is probably an error message
-                lines.append(f"⚠️ {df}")
-
-    lines.append("## 5. Saved plots\n")
-    for k, v in (saved_plots or {}).items():
-        if isinstance(v, dict):
-            lines.append(f"### {k}")
-            for subk, subv in v.items():
-                lines.append(f"- {subk}: {subv}")
-        else:
-            lines.append(f"- {k}: {v}")
-
-    lines.append("## 6. Recommendations\n")
-    lines.append("- No statistically significant conversion uplift detected.\n")
-    lines.append("- Investigate segments where lift might be concentrated (device, country).\n")
-    lines.append("- Verify data generation; check for synthetic data artifacts in retention.\n")
-    lines.append("- Consider increasing sample size or experiment duration.\n")
-
-    # write file
-    os.makedirs(REPORT_DIR, exist_ok=True)
-    with open(filename, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines))
-
-    return filename
-
-
-# ---------- 7) Convert MD -> PDF (best-effort) ----------
-def convert_md_to_pdf(md_path: str, pdf_path: Optional[str] = None) -> Optional[str]:
-    if pdf_path is None:
-        pdf_path = md_path.rsplit('.', 1)[0] + '.pdf'
-    # try pandoc
-    try:
-        subprocess.run(['pandoc', md_path, '-o', pdf_path], check=True)
-        return pdf_path
-    except Exception:
-        pass
-
-    # try nbconvert fallback
-    try:
-        tmp_nb = md_path.rsplit('.', 1)[0] + '_tmp.ipynb'
-        nb = {
-            'cells': [
-                {
-                    'cell_type': 'markdown',
-                    'metadata': {},
-                    'source': [open(md_path, 'r', encoding='utf-8').read()]
-                }
-            ],
-            'metadata': {'kernelspec': {'display_name': 'Python 3', 'language': 'python', 'name': 'python3'}},
-            'nbformat': 4,
-            'nbformat_minor': 5
+    # ---------------- Main orchestrator ----------------
+    def generate_full_report(self, data: pd.DataFrame, conversion_df: pd.DataFrame,
+                             revenue_df: pd.DataFrame, retention_df: pd.DataFrame,
+                             cohort_df: pd.DataFrame, segment_by: Optional[str]=None) -> Dict[str,Any]:
+        """
+        Run full pipeline and return a dict with paths & serializable results.
+        """
+        print("Starting full report generation...")
+        summary = self.generate_summary(data)
+        interpretation = self.interpret_results(data, conversion_df, revenue_df)
+        quality = self.check_data_quality(data)
+        segments = self.analyze_segments(data, segment_by)
+        visualizations = self.save_all_visualizations(conversion_df, revenue_df, retention_df, cohort_df, data)
+        md_path = self.generate_markdown_report(summary, interpretation, quality, segments, visualizations)
+        pdf_path = self.convert_to_pdf(md_path)
+        result = {
+            'markdown_report': md_path,
+            'pdf_report': pdf_path,
+            'summary': summary.to_dict(),
+            'interpretation': {
+                'conversion_test': interpretation['conversion_test'].to_dict(),
+                'revenue_test': interpretation['revenue_test'].to_dict(),
+                'recommendations': interpretation['recommendations']
+            },
+            'quality_checks': quality,
+            'segments': {k: (v.to_dict(orient='records') if isinstance(v, pd.DataFrame) else v) for k,v in (segments.items() if isinstance(segments, dict) else [])},
+            'visualizations': visualizations
         }
-        with open(tmp_nb, 'w', encoding='utf-8') as f:
-            json.dump(nb, f)
-        subprocess.run(['jupyter', 'nbconvert', '--to', 'pdf', tmp_nb, '--output', pdf_path.rsplit('.', 1)[0]], check=True)
-        return pdf_path
+        print("Report generation finished.")
+        return result
+
+# ---------- Helper local functions ----------
+def convify(val) -> str:
+    """Format revenue numbers with commas and two decimals (string)."""
+    try:
+        return f"{float(val):,.2f}"
     except Exception:
-        return None
-
-
-# ---------- 8) Orchestrator ----------
-def run_full_extended_report(ab, coh, viz, data: pd.DataFrame, conversion_df: pd.DataFrame,
-                             revenue_df: pd.DataFrame, retention_df: pd.DataFrame, cohort_df: pd.DataFrame,
-                             seg_by: str = 'device_type') -> Dict[str, Any]:
-    """
-    Run full extended reporting pipeline.
-    Returns dict with md_path, pdf_path, saved_plots, summary, interp, checks, segments
-    """
-    # 1. summary
-    summary = generate_summary(data)
-    # 2. interpretation
-    interp = interpret_ab_test(ab, data, conversion_df, revenue_df)
-    # 3. quality checks
-    checks = data_quality_checks(data)
-    # 4. segmentation
-    segments = segmentation_analysis(data, by=seg_by)
-    # 5. export plots (pass coh explicitly)
-    saved = save_all_plots(viz, conversion_df, revenue_df, retention_df, cohort_df, ab, data, coh)
-    # 6. generate md
-    md_path = generate_report_md(summary, interp, checks, segments, saved)
-    # 7. try pdf
-    pdf_path = convert_md_to_pdf(md_path)
-
-    return {
-        'md_path': md_path,
-        'pdf_path': pdf_path,
-        'saved_plots': saved,
-        'summary': summary,
-        'interp': interp,
-        'checks': checks,
-        'segments': segments
-    }
-
+        return str(val)
 

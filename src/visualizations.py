@@ -31,20 +31,24 @@ class ABTestVisualizer:
         """
         Method for saving a plot
         """
-        path = os.path.join(self.save_dir, filename)
+        try:
+            os.makedirs(self.save_dir, exist_ok=True)
+            path = os.path.join(self.save_dir, filename)
 
-        if format == "html":
-            fig.write_html(f"{path}.html")
-            print(f"Plot saved: {path}.html")
-        elif format in ["png", "jpg", "jpeg", "svg"]:
-            # Requires pip install kaleido
-            try:
-                fig.write_image(f"{path}.{format}", scale=2)
-                print(f"Plot saved: {path}.{format}")
-            except ValueError:
-                print("Error saving image. Install kaleido: pip install kaleido")
-        else:
-            print("Unknown file format")
+            if format == "html":
+                fig.write_html(f"{path}.html")
+                print(f"Plot saved: {path}.html")
+            elif format in ["png", "jpg", "jpeg", "svg"]:
+                try:
+                    import kaleido
+                    fig.write_image(f"{path}.{format}", scale=2)
+                    print(f"Plot saved: {path}.{format}")
+                except ImportError:
+                    print("Kaleido not installed. Install: pip install kaleido")
+                    print("Falling back to HTML format")
+                    fig.write_html(f"{path}.html")
+        except Exception as e:
+            print(f"Error saving plot: {e}")
 
     def plot_conversion_rate(self, conversion_data, title="Conversion Rate Comparison"):
         """

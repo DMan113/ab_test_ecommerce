@@ -3,11 +3,12 @@ Downloading data for e-commerce A/B testing
 """
 import pandas as pd
 import numpy as np
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, update, MetaData
 import os
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import uuid
+import random
 
 load_dotenv()
 
@@ -18,7 +19,7 @@ class DataLoader:
         if db_connection_string is None:
             db_connection_string = os.getenv(
                 'DATABASE_URL',
-                'postgresql://DB_USER:DB_PASSWORD@DB_HOST:DB_PORT/DB_NAME?client_encoding=utf8'
+                'postgresql://ab_test_user:1234@localhost:5432/ecommerce_ab_test?client_encoding=utf8'
             )
         print(f"Connection string used: {db_connection_string}")
         print(f"The way to CSV: {csv_path}")
@@ -30,8 +31,9 @@ class DataLoader:
         Database initialization: creating tables, indexes, and views
         """
         schema_sql = """
--- Database schema for e-commerce A/B testing
--- Users table
+-- Database Schema for E-Commerce A/B Testing
+
+-- Users Table
 CREATE TABLE IF NOT EXISTS users (
     user_id SERIAL PRIMARY KEY,
     user_uuid VARCHAR(100) UNIQUE NOT NULL,
@@ -150,101 +152,141 @@ GROUP BY ua.experiment_name, eg.group_name;
         """
         Loading data from CSV, processing and inserting into the database
         """
-        #  CSV reading
-        df = pd.read_csv(self.csv_path)
-        print(f"Loaded {len(df)} transactions from CSV.")
+        # Clear all tables before loading to avoid conflicts
+        truncate_sql = """
+TRUNCATE TABLE ab_test_metrics CASCADE;
+TRUNCATE TABLE events CASCADE;
+TRUNCATE TABLE transactions CASCADE;
+TRUNCATE TABLE products CASCADE;
+TRUNCATE TABLE user_assignments CASCADE;
+TRUNCATE TABLE experiment_groups CASCADE;
+TRUNCATE TABLE users CASCADE;
+        """
+        with self.engine.connect() as conn:
+            conn.execute(text(truncate_sql))
+            conn.commit()
+        print("Cleared all tables before loading new data.")
 
-        # Renaming columns to match the schema
-        df = df.rename(columns={
-            'Transaction_ID': 'transaction_id',
-            'User_Name': 'user_name',
-            'Age': 'age',
-            'Country': 'country',
-            'Product_Category': 'category',
-            'Purchase_Amount': 'total_amount',
-            'Payment_Method': 'payment_method',
-            'Transaction_Date': 'transaction_date'
-        })
+        # CSV reading (replace with real if exists; here fake for simulation)
+        # df = pd.read_csv(self.csv_path)
+        # For simulation:
+        num_transactions = 50000
+        # Random num_buyers pool: between 5000-20000 for repeat rate ~2.5-10 trans/user
+        buyer_pool_size = random.randint(5000, 20000)
+        fake_data = {
+            'transaction_id': range(1, num_transactions + 1),
+            'user_name': [f'user_{random.randint(1, buyer_pool_size)}' for _ in range(num_transactions)],  # Random assignment to users
+            'age': np.random.randint(18, 70, num_transactions),
+            'country': np.random.choice(['USA', 'UK', 'Germany', 'France', 'Canada'], num_transactions),
+            'category': np.random.choice(['Electronics', 'Books', 'Clothing', 'Home'], num_transactions),
+            'total_amount': np.random.uniform(10, 500, num_transactions),
+            'payment_method': np.random.choice(['Credit Card', 'PayPal', 'Debit Card'], num_transactions),
+            'transaction_date': [datetime.now() - timedelta(days=random.randint(1, 365)) for _ in range(num_transactions)]
+        }
+        df = pd.DataFrame(fake_data)
+        print(f"Loaded {len(df)} transactions from CSV (simulated).")
 
         # Date processing
         df['transaction_date'] = pd.to_datetime(df['transaction_date'])
 
-        # Generation of unique users
-        unique_users = df[['user_name', 'age', 'country']].drop_duplicates().reset_index(drop=True)
-        unique_users['user_id'] = unique_users.index + 1
-        unique_users['user_uuid'] = [str(uuid.uuid4()) for _ in range(len(unique_users))]
+        # Unique buyers
+        unique_buyers = df[['user_name', 'age', 'country']].drop_duplicates().reset_index(drop=True)
+        num_buyers = len(unique_buyers)
+        unique_buyers['user_uuid'] = [str(uuid.uuid4()) for _ in range(num_buyers)]
 
-        # Generation registration_date: min transaction_date per user - random 1-365 days
+        # Registration date for buyers
         min_dates = df.groupby('user_name')['transaction_date'].min().reset_index()
-        unique_users = unique_users.merge(min_dates, on='user_name')
-        unique_users['registration_date'] = unique_users['transaction_date'] - pd.to_timedelta(np.random.randint(1, 366, len(unique_users)), unit='D')
-        unique_users = unique_users.drop(columns=['transaction_date'])
+        unique_buyers = unique_buyers.merge(min_dates, on='user_name')
+        unique_buyers['registration_date'] = unique_buyers['transaction_date'] - pd.to_timedelta(np.random.randint(1, 366, num_buyers), unit='D')
+        unique_buyers = unique_buyers.drop(columns=['transaction_date'])
 
-        # Generation device_type
-        unique_users['device_type'] = np.random.choice(['mobile', 'desktop', 'tablet'], len(unique_users))
+        # Device type for buyers
+        unique_buyers['device_type'] = np.random.choice(['mobile', 'desktop', 'tablet'], num_buyers)
 
-        # Preparing users_df
-        users_df = unique_users[['user_id', 'user_uuid', 'registration_date', 'country', 'device_type']]
-        users_df.to_sql('users', self.engine, if_exists='append', index=False)
-        print(f"Inserted {len(users_df)} users.")
+        # Non-converted users (4x buyers)
+        num_non_buyers = num_buyers * 4
+        non_buyers = pd.DataFrame({
+            'user_uuid': [str(uuid.uuid4()) for _ in range(num_non_buyers)],
+            'registration_date': [datetime.now() - timedelta(days=random.randint(1, 365)) for _ in range(num_non_buyers)],
+            'country': np.random.choice(['USA', 'UK', 'Germany', 'France', 'Canada'], num_non_buyers),
+            'device_type': np.random.choice(['mobile', 'desktop', 'tablet'], num_non_buyers)
+        })
 
-        # Mapping user_id back to df
-        user_id_map = dict(zip(unique_users['user_name'], unique_users['user_id']))
-        df['user_id'] = df['user_name'].map(user_id_map)
+        # All users (without user_id, let DB generate)
+        all_users = pd.concat([unique_buyers[['user_uuid', 'registration_date', 'country', 'device_type']], non_buyers], ignore_index=True)
+        all_users.to_sql('users', self.engine, if_exists='append', index=False)
+        print(f"Inserted {len(all_users)} users (buyers: {num_buyers}, non-buyers: {num_non_buyers}).")
 
-        # Product and transaction generation
-        df['product_id'] = df.index + 1
+        # Get generated user_ids
+        users_generated = pd.read_sql("SELECT user_id, user_uuid FROM users", self.engine)
+        user_uuid_to_id = dict(zip(users_generated['user_uuid'], users_generated['user_id']))
+
+        # Map user_id to buyers (for transactions)
+        unique_buyers['user_id'] = unique_buyers['user_uuid'].map(user_uuid_to_id)
+        user_name_to_id = dict(zip(unique_buyers['user_name'], unique_buyers['user_id']))
+        df['user_id'] = df['user_name'].map(user_name_to_id)
+
+        # Products (without product_id, let DB generate)
         df['product_name'] = 'Product ' + df['category'] + ' ' + df['transaction_id'].astype(str)
         df['price'] = df['total_amount']  # Assume quantity=1
         df['quantity'] = 1
         df['session_id'] = [str(uuid.uuid4()) for _ in range(len(df))]
 
-        # Підготовка products_df
-        products_df = df[['product_id', 'product_name', 'category', 'price']].drop_duplicates()
+        products_df = df[['product_name', 'category', 'price']].drop_duplicates()
         products_df.to_sql('products', self.engine, if_exists='append', index=False)
         print(f"Inserted {len(products_df)} products.")
 
-        # Preparing trans_df
-        trans_df = df[['transaction_id', 'user_id', 'product_id', 'transaction_date', 'quantity', 'total_amount', 'session_id']]
+        # Get generated product_ids
+        products_generated = pd.read_sql("SELECT product_id, product_name FROM products", self.engine)
+        product_name_to_id = dict(zip(products_generated['product_name'], products_generated['product_id']))
+        df['product_id'] = df['product_name'].map(product_name_to_id)
+
+        # Transactions (without transaction_id)
+        trans_df = df[['user_id', 'product_id', 'transaction_date', 'quantity', 'total_amount', 'session_id']]
         trans_df.to_sql('transactions', self.engine, if_exists='append', index=False)
         print(f"Inserted {len(trans_df)} transactions.")
 
-        # Transaction-based event generation (funnel simulation)
+        # Events with drop-offs
         events = []
+        product_ids = pd.read_sql("SELECT product_id FROM products", self.engine)['product_id'].tolist()
+
+        # For buyers (from transactions)
         for _, row in df.iterrows():
             base_time = row['transaction_date']
             session_id = row['session_id']
             user_id = row['user_id']
             product_id = row['product_id']
 
-            # View
+            # View (always)
             events.append({
                 'user_id': user_id,
                 'event_type': 'view',
                 'product_id': product_id,
-                'event_timestamp': base_time - timedelta(minutes=np.random.randint(10, 30)),
+                'event_timestamp': base_time - timedelta(minutes=random.randint(10, 30)),
                 'session_id': session_id
             })
 
-            # Add to cart
-            events.append({
-                'user_id': user_id,
-                'event_type': 'add_to_cart',
-                'product_id': product_id,
-                'event_timestamp': base_time - timedelta(minutes=np.random.randint(5, 10)),
-                'session_id': session_id
-            })
+            # Add to cart (90%)
+            if random.random() < 0.9:
+                events.append({
+                    'user_id': user_id,
+                    'event_type': 'add_to_cart',
+                    'product_id': product_id,
+                    'event_timestamp': base_time - timedelta(minutes=random.randint(5, 10)),
+                    'session_id': session_id
+                })
 
-            # Checkout
-            events.append({
-                'user_id': user_id,
-                'event_type': 'checkout',
-                'product_id': product_id,
-                'event_timestamp': base_time - timedelta(minutes=np.random.randint(1, 5)),
-                'session_id': session_id
-            })
+            # Checkout (70%)
+            if random.random() < 0.7:
+                events.append({
+                    'user_id': user_id,
+                    'event_type': 'checkout',
+                    'product_id': product_id,
+                    'event_timestamp': base_time - timedelta(minutes=random.randint(1, 5)),
+                    'session_id': session_id
+                })
 
-            # Purchase
+            # Purchase (always for buyers)
             events.append({
                 'user_id': user_id,
                 'event_type': 'purchase',
@@ -253,11 +295,55 @@ GROUP BY ua.experiment_name, eg.group_name;
                 'session_id': session_id
             })
 
+        # For non-buyers (users without transactions)
+        non_buyers_query = """
+SELECT u.user_id, u.user_uuid, u.registration_date
+FROM users u
+LEFT JOIN transactions t ON u.user_id = t.user_id
+WHERE t.user_id IS NULL
+        """
+        non_buyers_df = pd.read_sql(non_buyers_query, self.engine)
+        for _, non_buyer in non_buyers_df.iterrows():
+            num_sessions = random.randint(1, 5)
+            for _ in range(num_sessions):
+                session_id = str(uuid.uuid4())
+                base_time = non_buyer['registration_date'] + timedelta(days=random.randint(1, 180))
+                product_id = random.choice(product_ids)
+
+                # View (always)
+                events.append({
+                    'user_id': non_buyer['user_id'],
+                    'event_type': 'view',
+                    'product_id': product_id,
+                    'event_timestamp': base_time - timedelta(minutes=random.randint(10, 30)),
+                    'session_id': session_id
+                })
+
+                # Add to cart (50%)
+                if random.random() < 0.5:
+                    events.append({
+                        'user_id': non_buyer['user_id'],
+                        'event_type': 'add_to_cart',
+                        'product_id': product_id,
+                        'event_timestamp': base_time - timedelta(minutes=random.randint(5, 10)),
+                        'session_id': session_id
+                    })
+
+                # Checkout (30%)
+                if random.random() < 0.3:
+                    events.append({
+                        'user_id': non_buyer['user_id'],
+                        'event_type': 'checkout',
+                        'product_id': product_id,
+                        'event_timestamp': base_time - timedelta(minutes=random.randint(1, 5)),
+                        'session_id': session_id
+                    })
+
         events_df = pd.DataFrame(events)
         events_df.to_sql('events', self.engine, if_exists='append', index=False)
-        print(f"Generated and inserted {len(events_df)} подій.")
+        print(f"Generated and inserted {len(events_df)} events with drop-offs.")
 
-        # Creating experimental groups
+        # Experimental groups (without group_id)
         groups_df = pd.DataFrame([
             {'group_name': 'control', 'description': 'Control group no changes'},
             {'group_name': 'treatment', 'description': 'Test group with new recommendation system'}
@@ -265,7 +351,7 @@ GROUP BY ua.experiment_name, eg.group_name;
         groups_df.to_sql('experiment_groups', self.engine, if_exists='append', index=False)
         print("Experimental groups created.")
 
-        # Assigning users to groups (random 50/50)
+        # Assign users to groups (random 50/50)
         users = pd.read_sql("SELECT user_id FROM users", self.engine)
         group_ids = pd.read_sql("SELECT group_id, group_name FROM experiment_groups", self.engine)
 
@@ -280,6 +366,19 @@ GROUP BY ua.experiment_name, eg.group_name;
         )
         print(f"Assigned {len(users)} users to groups.")
 
+        # Simulate treatment effect (+10% revenue for treatment)
+        metadata = MetaData()
+        metadata.reflect(self.engine)
+        transactions_table = metadata.tables['transactions']
+
+        treatment_users = users[users['group_id'] == treatment_id]['user_id'].tolist()
+        if treatment_users:
+            stmt = update(transactions_table).where(transactions_table.c.user_id.in_(treatment_users)).values(total_amount=transactions_table.c.total_amount * 1.1)
+            with self.engine.connect() as conn:
+                conn.execute(stmt)
+                conn.commit()
+        print("Simulated treatment effect: +10% revenue for treatment group.")
+
     def run_full_load(self):
         """
         Full process: initialization + data loading
@@ -289,7 +388,5 @@ GROUP BY ua.experiment_name, eg.group_name;
         print("Data loading complete!")
 
 if __name__ == "__main__":
-    # Example of use
-    # First, download the dataset from Kaggle and specify the path to the CSV
-    loader = DataLoader()  # Now the path is calculated automatically relative to src
+    loader = DataLoader()
     loader.run_full_load()
