@@ -77,7 +77,9 @@ DATABASE_URL=postgresql://user:password@localhost:5432/ecommerce_ab_test
 ### 5. Run the analysis notebook
 
 ```bash
-jupyter notebook notebooks/01_complete_ab_test_analysis.ipynb
+jupytext --to ipynb analysis_notebook.py 
+
+jupyter notebook      
 ```
 
 ---
