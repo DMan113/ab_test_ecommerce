@@ -1,6 +1,5 @@
 """
 Cohort Analysis for E-Commerce A/B Testing
-Refactored for stability, numeric correctness, and clean visualization.
 """
 
 import pandas as pd
@@ -18,16 +17,11 @@ class CohortAnalyzer:
 
     def __init__(self, db_connection_string=None):
         if db_connection_string is None:
-            db_connection_string = os.getenv(
-                'DATABASE_URL',
-                'postgresql://ab_test_user:1234@localhost:5432/ecommerce_ab_test?client_encoding=utf8'
-            )
+            db_connection_string = os.getenv('DATABASE_URL')
         self.engine = create_engine(db_connection_string)
 
-    # -------------------------------------------------------------------------
-    # 1) Load cohort data
-    # -------------------------------------------------------------------------
     def get_cohort_data(self, experiment_name='recommendation_engine_v2'):
+        """Loading cohort data from the database"""
         query = """
             SELECT 
                 u.user_id,
@@ -50,73 +44,93 @@ class CohortAnalyzer:
 
         df = pd.read_sql(query, self.engine, params={'exp_name': experiment_name})
 
-        # Normalize types once here
-        df['cohort_month'] = pd.to_datetime(df['cohort_month'])
-        df['transaction_month'] = pd.to_datetime(df['transaction_month'])
+        # data type conversion
+        df['cohort_month'] = pd.to_datetime(df['cohort_month'], errors='coerce')
+        df['transaction_month'] = pd.to_datetime(df['transaction_month'], errors='coerce')
+        df['registration_date'] = pd.to_datetime(df['registration_date'], errors='coerce')
+        df['transaction_date'] = pd.to_datetime(df['transaction_date'], errors='coerce')
 
-        print(f"Loaded {len(df)} records for cohort analysis")
+        # Delete rows with invalid dates
+        df = df.dropna(subset=['cohort_month', 'registration_date'])
+
+        print(f"✅ Loaded {len(df)} records for cohort analysis")
+        print(f"📊 Date range: {df['cohort_month'].min()} to {df['cohort_month'].max()}")
+
         return df
 
-    # -------------------------------------------------------------------------
-    # 2) Retention calculation
-    # -------------------------------------------------------------------------
     def calculate_cohort_retention(self, cohort_data):
+        """
+        Retention rate calculation with correct NaN handling
+        """
         data = cohort_data.copy()
 
-        # Ensure datetimes
+        # Make sure the dates are in the correct format
         data['cohort_month'] = pd.to_datetime(data['cohort_month'])
         data['transaction_month'] = pd.to_datetime(data['transaction_month'])
 
-        # Period number in months
+        # Period calculation
         data['period_number'] = (
             (data['transaction_month'].dt.year - data['cohort_month'].dt.year) * 12 +
             (data['transaction_month'].dt.month - data['cohort_month'].dt.month)
         )
 
-        # Remove users who have no transactions (period = NaN)
-        active = data[data['period_number'].notna() & (data['period_number'] >= 0)].copy()
-        active['period_number'] = active['period_number'].astype(int)
+        # Delete invalid periods
+        data = data[data['period_number'].notna()].copy()
+        data = data[data['period_number'] >= 0].copy()
+        data['period_number'] = data['period_number'].astype(int)
 
-        # Count unique active users per period
-        retention = active.groupby(
+        # Calculating the number of active users
+        retention = data.groupby(
             ['cohort_month', 'group_name', 'period_number']
-        )['user_id'].nunique().reset_index(name='users')
+        )['user_id'].nunique().reset_index(name='active_users')
 
-        # Cohort sizes
-        cohort_sizes = data.groupby(
+        # Calculating cohort size (all users who signed up this month)
+        cohort_sizes = cohort_data.groupby(
             ['cohort_month', 'group_name']
         )['user_id'].nunique().reset_index(name='cohort_size')
 
-        # Merge
-        retention = retention.merge(cohort_sizes, on=['cohort_month', 'group_name'], how='left')
+        # Merging
+        retention = retention.merge(
+            cohort_sizes,
+            on=['cohort_month', 'group_name'],
+            how='left'
+        )
 
-        # Retention %
+        # Preventing division by zero
+        retention['cohort_size'] = retention['cohort_size'].replace(0, np.nan)
         retention['retention_rate'] = (
-            retention['users'] / retention['cohort_size'] * 100
+            (retention['active_users'] / retention['cohort_size']) * 100
         ).round(2)
 
-        # Ensure numeric
-        retention['retention_rate'] = pd.to_numeric(retention['retention_rate'], errors="coerce")
+        # Replace inf and negative values ​​with NaN
+        retention['retention_rate'] = retention['retention_rate'].replace([np.inf, -np.inf], np.nan)
+
+        # Delete rows with NaN retention_rate
+        retention = retention.dropna(subset=['retention_rate'])
+
+        print(f"✅ Calculated retention for {len(retention)} cohort-period combinations")
+        print(f"📈 Retention range: {retention['retention_rate'].min():.1f}% to {retention['retention_rate'].max():.1f}%")
 
         return retention
 
-    # -------------------------------------------------------------------------
-    # 3) Revenue per cohort
-    # -------------------------------------------------------------------------
     def calculate_cohort_revenue(self, cohort_data):
+        """Calculation of revenue per cohort"""
         data = cohort_data.copy()
 
         data['cohort_month'] = pd.to_datetime(data['cohort_month'])
         data['transaction_month'] = pd.to_datetime(data['transaction_month'])
 
+        # Period calculation
         data['period_number'] = (
             (data['transaction_month'].dt.year - data['cohort_month'].dt.year) * 12 +
             (data['transaction_month'].dt.month - data['cohort_month'].dt.month)
         )
 
+        # Filtration
         active = data[data['period_number'].notna() & (data['period_number'] >= 0)].copy()
         active['period_number'] = active['period_number'].astype(int)
 
+        # Aggregation
         revenue = active.groupby(
             ['cohort_month', 'group_name', 'period_number']
         ).agg(
@@ -124,22 +138,21 @@ class CohortAnalyzer:
             active_users=('user_id', 'nunique')
         ).reset_index()
 
-        revenue['arpu'] = (
-            revenue['revenue'] / revenue['active_users']
-        ).round(2)
+        # ARPU (Average Revenue Per User)
+        revenue['arpu'] = (revenue['revenue'] / revenue['active_users']).round(2)
 
-        # cumulative revenue
+        # Cumulative revenue
         revenue = revenue.sort_values(['cohort_month', 'group_name', 'period_number'])
         revenue['cumulative_revenue'] = revenue.groupby(
             ['cohort_month', 'group_name']
         )['revenue'].cumsum()
 
+        print(f"✅ Calculated revenue for {len(revenue)} cohort-period combinations")
+
         return revenue
 
-    # -------------------------------------------------------------------------
-    # 4) LTV
-    # -------------------------------------------------------------------------
     def calculate_ltv(self, cohort_data):
+        """Lifetime Value Calculation"""
         revenue_data = self.calculate_cohort_revenue(cohort_data)
 
         cohort_sizes = cohort_data.groupby(
@@ -155,47 +168,51 @@ class CohortAnalyzer:
 
         return ltv
 
-    # -------------------------------------------------------------------------
-    # 5) Cohort pivot (used by heatmaps)
-    # -------------------------------------------------------------------------
     def create_cohort_pivot_table(self, retention_data):
         """
-        Produce numeric, clean cohort matrices for each group.
-        Ensures:
-        - sorted cohorts
-        - sorted periods
-        - numeric pivot values
+        Creating a pivot table without NaN
         """
-
         pivot_tables = {}
 
         for group in retention_data['group_name'].unique():
             group_df = retention_data[retention_data['group_name'] == group].copy()
 
+            # Remove NaN before creating pivot
+            group_df = group_df.dropna(subset=['retention_rate'])
+
+            # Creating a pivot table
             pivot = group_df.pivot_table(
                 index='cohort_month',
                 columns='period_number',
                 values='retention_rate',
-                aggfunc='mean'
+                aggfunc='mean'  # Use mean for aggregation
             )
 
-            # Make sure everything is numeric
-            pivot = pivot.apply(pd.to_numeric, errors="coerce")
+            # Fill NaN with zeros (if there is no data for the period)
+            pivot = pivot.fillna(0)
 
-            # Sort rows & columns
+            # Convert all values ​​to numeric
+            pivot = pivot.apply(pd.to_numeric, errors='coerce')
+
+            # Sorting
             pivot = pivot.sort_index()
             pivot = pivot.reindex(sorted(pivot.columns), axis=1)
+
+            # Final check: replace all NaN with 0
+            pivot = pivot.fillna(0)
+
+            print(f"✅ Created pivot for {group}: shape {pivot.shape}")
+            print(f"   NaN values: {pivot.isna().sum().sum()}")
 
             pivot_tables[group] = pivot
 
         return pivot_tables
 
-    # -------------------------------------------------------------------------
-    # 6) A/B cohort comparison
-    # -------------------------------------------------------------------------
     def compare_cohorts_ab(self, cohort_data):
+        """Comparison of cohorts between groups A/B"""
         retention = self.calculate_cohort_retention(cohort_data)
 
+        # Mean retention by periods
         mean_retention = retention.groupby(
             ['period_number', 'group_name']
         )['retention_rate'].mean().reset_index()
@@ -206,6 +223,7 @@ class CohortAnalyzer:
             values='retention_rate'
         )
 
+        # Lift calculation
         if {'control', 'treatment'}.issubset(retention_pivot.columns):
             retention_pivot['lift'] = (
                 (retention_pivot['treatment'] - retention_pivot['control']) /

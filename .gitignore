@@ -1,0 +1,23 @@
+.env
+
+# SQLite Database
+db/
+
+# Generated Visualizations and Reports
+analysis_report/
+
+
+# Jupyter and IDE Files
+*.ipynb
+.ipynb_checkpoints/
+*.idea/
+.idea/
+anaconda_projects/
+
+data/
+
+.analysis_notebook.ipynb.layout
+
+# Python Compilation Cache
+__pycache__/
+*.pyc

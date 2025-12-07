@@ -1,5 +1,5 @@
 """
-Visualizations for A/B testing and cohort analysis
+Visualizations for A/B testing and cohort analysis - COMPLETE FIXED VERSION
 """
 import numpy as np
 import pandas as pd
@@ -37,18 +37,18 @@ class ABTestVisualizer:
 
             if format == "html":
                 fig.write_html(f"{path}.html")
-                print(f"Plot saved: {path}.html")
+                print(f"✅ Plot saved: {path}.html")
             elif format in ["png", "jpg", "jpeg", "svg"]:
                 try:
                     import kaleido
                     fig.write_image(f"{path}.{format}", scale=2)
-                    print(f"Plot saved: {path}.{format}")
+                    print(f"✅ Plot saved: {path}.{format}")
                 except ImportError:
-                    print("Kaleido not installed. Install: pip install kaleido")
+                    print("⚠️ Kaleido not installed. Install: pip install kaleido")
                     print("Falling back to HTML format")
                     fig.write_html(f"{path}.html")
         except Exception as e:
-            print(f"Error saving plot: {e}")
+            print(f"❌ Error saving plot: {e}")
 
     def plot_conversion_rate(self, conversion_data, title="Conversion Rate Comparison"):
         """
@@ -124,18 +124,47 @@ class ABTestVisualizer:
         if title is None:
             title = f"Cohort Retention Heatmap - {group_name.capitalize()} Group"
 
-        # Convert the index to year-month format
-        cohort_pivot.index = cohort_pivot.index.strftime('%Y-%m')
+        # Handle dates properly
+        try:
+            if not isinstance(cohort_pivot.index, pd.DatetimeIndex):
+                cohort_pivot.index = pd.to_datetime(cohort_pivot.index)
+            formatted_index = cohort_pivot.index.strftime('%b %Y')
+        except Exception as e:
+            print(f"⚠️ Warning: Could not format dates: {e}")
+            formatted_index = [str(x) for x in cohort_pivot.index]
+
+        # Ensure all values are numeric
+        pivot_values = cohort_pivot.values.copy()
+        pivot_values = np.nan_to_num(pivot_values, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Create text for hover
+        text_values = []
+        for row in pivot_values:
+            text_row = []
+            for val in row:
+                if val > 0:
+                    text_row.append(f'{val:.1f}%')
+                else:
+                    text_row.append('')
+            text_values.append(text_row)
 
         fig = go.Figure(data=go.Heatmap(
-            z=cohort_pivot.values,
+            z=pivot_values,
             x=[f"Month {int(col)}" for col in cohort_pivot.columns],
-            y=cohort_pivot.index,
+            y=formatted_index,
             colorscale='RdYlGn',
-            text=cohort_pivot.values,
-            texttemplate='%{text:.1f}%',
+            text=text_values,
+            texttemplate='%{text}',
             textfont={"size": 10},
-            colorbar=dict(title="Retention %")
+            colorbar=dict(title="Retention %"),
+            hovertemplate=(
+                '<b>Cohort:</b> %{y}<br>'
+                '<b>Period:</b> %{x}<br>'
+                '<b>Retention:</b> %{z:.1f}%<br>'
+                '<extra></extra>'
+            ),
+            zmin=0,
+            zmax=100
         ))
 
         fig.update_layout(
@@ -155,25 +184,32 @@ class ABTestVisualizer:
         fig = go.Figure()
 
         for group in retention_data['group_name'].unique():
-            group_data = retention_data[retention_data['group_name'] == group]
+            group_data = retention_data[retention_data['group_name'] == group].copy()
+
+            # Remove NaN before aggregation
+            group_data = group_data.dropna(subset=['retention_rate'])
 
             # Aggregate by periods
             avg_retention = group_data.groupby('period_number')['retention_rate'].mean()
 
-            fig.add_trace(go.Scatter(
-                x=avg_retention.index,
-                y=avg_retention.values,
-                mode='lines+markers',
-                name=group.capitalize(),
-                line=dict(
-                    color=self.colors.get(group, '#95a5a6'),
-                    width=3
-                ),
-                marker=dict(size=8),
-                hovertemplate='<b>%{fullData.name}</b><br>' +
-                              'Period: %{x}<br>' +
-                              'Retention: %{y:.2f}%<extra></extra>'
-            ))
+            # Ensure valid values
+            avg_retention = avg_retention.replace([np.inf, -np.inf], np.nan).dropna()
+
+            if len(avg_retention) > 0:
+                fig.add_trace(go.Scatter(
+                    x=avg_retention.index,
+                    y=avg_retention.values,
+                    mode='lines+markers',
+                    name=group.capitalize(),
+                    line=dict(
+                        color=self.colors.get(group, '#95a5a6'),
+                        width=3
+                    ),
+                    marker=dict(size=8),
+                    hovertemplate='<b>%{fullData.name}</b><br>' +
+                                  'Period: %{x}<br>' +
+                                  'Retention: %{y:.2f}%<extra></extra>'
+                ))
 
         fig.update_layout(
             title=title,
@@ -188,31 +224,35 @@ class ABTestVisualizer:
 
     def plot_cumulative_revenue(self, revenue_data, title="Cumulative Revenue by Cohort"):
         """
-        Кумулятивний revenue по когортам
+        Cumulative revenue by cohort
         """
         fig = go.Figure()
 
         for group in revenue_data['group_name'].unique():
-            group_data = revenue_data[revenue_data['group_name'] == group]
+            group_data = revenue_data[revenue_data['group_name'] == group].copy()
+
+            # Remove NaN and inf
+            group_data = group_data.replace([np.inf, -np.inf], np.nan).dropna(subset=['cumulative_revenue'])
 
             # Aggregate by periods
             avg_cumulative = group_data.groupby('period_number')['cumulative_revenue'].mean()
 
-            fig.add_trace(go.Scatter(
-                x=avg_cumulative.index,
-                y=avg_cumulative.values,
-                mode='lines+markers',
-                name=group.capitalize(),
-                line=dict(
-                    color=self.colors.get(group, '#95a5a6'),
-                    width=3
-                ),
-                marker=dict(size=8),
-                fill='tonexty' if group == 'treatment' else None,
-                hovertemplate='<b>%{fullData.name}</b><br>' +
-                              'Period: %{x}<br>' +
-                              'Cumulative Revenue: $%{y:,.2f}<extra></extra>'
-            ))
+            if len(avg_cumulative) > 0:
+                fig.add_trace(go.Scatter(
+                    x=avg_cumulative.index,
+                    y=avg_cumulative.values,
+                    mode='lines+markers',
+                    name=group.capitalize(),
+                    line=dict(
+                        color=self.colors.get(group, '#95a5a6'),
+                        width=3
+                    ),
+                    marker=dict(size=8),
+                    fill='tonexty' if group == 'treatment' else None,
+                    hovertemplate='<b>%{fullData.name}</b><br>' +
+                                  'Period: %{x}<br>' +
+                                  'Cumulative Revenue: $%{y:,.2f}<extra></extra>'
+                ))
 
         fig.update_layout(
             title=title,
@@ -291,7 +331,7 @@ class ABTestVisualizer:
                 line=dict(width=2)
             ))
 
-        # Add a horizontal line at 0.8 (standard power)
+        # Add horizontal line at 0.8 (standard power)
         fig.add_hline(
             y=0.8,
             line_dash="dash",
@@ -333,7 +373,7 @@ class ABTestVisualizer:
             row=1, col=1
         )
 
-        # Add a significance line (alpha = 0.05)
+        # Add significance line (alpha = 0.05)
         fig.add_hline(
             y=0.05,
             line_dash="dash",
@@ -483,7 +523,7 @@ if __name__ == "__main__":
     conversion_metrics = report['conversion_metrics']
     revenue_metrics = report['revenue_metrics']
 
-    # Funnel з view
+    # Funnel from view
     funnel_query = "SELECT * FROM conversion_funnel"
     funnel_data = pd.read_sql(funnel_query, ab_analyzer.engine)
 
