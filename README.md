@@ -51,7 +51,7 @@ ab_test_ecommerce/
 ### 1. Clone the repository
 
 ```bash
-git clone <your-repo-url>
+git clone <https://github.com/DMan113/ab_test_ecommerce.git>
 cd ab_test_ecommerce
 ```
 
@@ -86,13 +86,17 @@ jupyter notebook notebooks/01_complete_ab_test_analysis.ipynb
 
 The project uses synthetic data generated to resemble real-world e-commerce behavior.
 
-* Users: 250,000+
+* Users: 250,000
 * Products: 50,000
 * Transactions: 50,000
 * Events (views → purchase): 1,400,000+
 * Experiment groups: control vs treatment
 
-You may also use real datasets (e.g., Kaggle).
+**External data (Kaggle):** The pipeline architecture (DB schema and ETL) is fully compatible with importing real data for further analysis.
+
+Alternatively, you can use real datasets from Kaggle:
+- [E-Commerce Transactions Dataset](https://www.kaggle.com/datasets/smayanj/e-commerce-transactions-dataset)
+- [E-commerce Clickstream Dataset](https://www.kaggle.com/datasets/waqi786/e-commerce-clickstream-and-transaction-dataset)
 
 ---
 
